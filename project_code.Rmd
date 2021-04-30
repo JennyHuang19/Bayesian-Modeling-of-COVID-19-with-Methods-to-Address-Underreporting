@@ -1,0 +1,1292 @@
+---
+title: "project_code"
+author: "Jenny Yijian Huang"
+date: "4/21/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+```{r}
+library(outbreaks)
+library(tidyverse)
+library(rstan)
+library(gridExtra)
+rstan_options (auto_write = TRUE)
+options (mc.cores = parallel::detectCores ())
+set.seed(3) # for reproductibility
+```
+
+```{r}
+theme_set(theme_bw())
+ggplot(data = influenza_england_1978_school) + 
+  geom_point(mapping = aes(x = date, y = in_bed)) + 
+  labs(y = "Number of students in bed")
+```
+
+We explore the use of Stan to fit mathematical models to infectious disease data. HMC seems promising for real-time inference in epidemic models.
+
+1. Estimate parameters characterizing an influenza outbreak in 1978 at a British boarding school, including infection rate, recovery rate, $$R_0$$, and recovery time through adapting the model proposed by Chatzilena et al. (change priors)
+
+2. Run Hamiltonion Monte Carlo sampling to approximate model parameter values.  (see justification in clinicalkey)
+
+3. Extend the SIR model to a dataset from COVID-19 outbreak. Compare the resulting parameter estimates to that of the influenza outbreak.
+
+Model
+
+Mathematical Model for Disease Transmission:
+Susceptible-Infected-Recovered (SIR) model
+
+Statistical Model
+
+Sampling Distribution: Negative Binomial
+Prior Distribution: beta, gamma, underreporting
+
+
+Fitting the Model:
+```{r}
+# time series of cases
+cases <- influenza_england_1978_school$in_bed  # Number of students in bed
+
+# total count
+N <- 763;
+
+# times
+n_days <- length(cases) 
+t <- seq(0, n_days, by = 1)
+t0 = 0 
+t <- t[-1]
+
+#initial conditions
+i0 <- 1
+s0 <- N - i0
+r0 <- 0
+y0 = c(S = s0, I = i0, R = r0)
+
+# data for Stan
+data_sir <- list(n_days = n_days, y0 = y0, t0 = t0, ts = t, N = N, cases = cases)
+
+# number of MCMC steps
+niter <- 2000
+```
+
+```{r}
+model <- stan_model("sir_negbin.stan")
+```
+
+Implement STAN's HMC for inference. 
+```{r}
+fit_sir_negbin <- sampling(model,
+                data = data_sir,
+                iter = niter,
+                chains = 4, 
+                seed = 0)
+```
+
+## HMC Diagnostics: check for convergence
+https://jrmihalj.github.io/estimating-transmission-by-fitting-mechanistic-models-in-Stan/
+```{r}
+library(coda)
+traceplot(fit_sir_negbin, pars = c("gamma", "beta"))
+# effectiveSize(fit_sir_negbin$gamma)
+summary(fit_sir_negbin)$summary[,"Rhat"]
+```
+
+```{r diagnostics1, echo=FALSE}
+mod1_diagnostics <-rstan::get_sampler_params(fit_sir_negbin)
+# Check for divergent transitions
+rstan::check_divergences(fit_sir_negbin)
+posterior_1 <- as.array(fit_sir_negbin)
+color_scheme_set("viridis")
+# Markov chain traceplots
+mcmc_trace(posterior_1, pars="lp__")
+mcmc_trace(posterior_1, pars=c("gamma", "beta"))
+mcmc_trace(posterior_1, pars="R0")
+mcmc_trace(posterior_1, pars="recovery_time")
+```
+
+```{r , echo=FALSE}
+# Univariate and bivariate marginal posterior distributions
+pairs(fit_sir_negbin, pars = c("beta", "gamma"), labels = c("beta", "gamma", "s(0)"), 
+      cex.labels=1.5, font.labels=9, condition = "accept_stat__")  
+# Kernel density estimates of each Markov chain separately, overlaid
+mcmc_dens_overlay(posterior_1, pars=c("beta", "gamma"))
+#Central posterior uncertainty intervals
+mcmc_intervals(posterior_1,pars = c("beta", "gamma"))
+```
+
+# Parameter Estimates/Results of Inference
+```{r}
+pars=c('beta', 'gamma', "R0", "recovery_time")
+```
+
+```{r}
+print(fit_sir_negbin, pars = pars)
+```
+
+# Posterior Predictive Check
+
+```{r}
+smr_pred <- cbind(as.data.frame(summary(
+  fit_sir_negbin, pars = "pred_cases", probs = c(0.05, 0.5, 0.95))$summary), t, cases)
+colnames(smr_pred) <- make.names(colnames(smr_pred)) # to remove % in the col names
+
+ggplot(smr_pred, mapping = aes(x = t)) +
+  geom_ribbon(aes(ymin = X5., ymax = X95.), fill = 'red', alpha = 0.35) +
+  geom_line(mapping = aes(x = t, y = X50.), color = 'red') + 
+  geom_point(mapping = aes(y = cases)) +
+  labs(x = "Day", y = "Number of students in bed")
+```
+# Prior Predictive Checks
+
+```{r}
+# NC population
+N <- 10.00E6;
+
+#initial conditions
+i0 <- 2636 # assume 2636 infected at beginning of outbreak.
+s0 <- N - i0
+r0 <- 0
+y0 = c(S = s0, I = i0, R = r0)
+
+# Cases
+# Cases
+inv_drate <- 20 # 0.05
+dths <- NC$deaths*inv_drate
+dths <- dths[!dths==0]
+# times
+n_days <- length(dths)
+t <- seq(1, n_days, by = 1)
+t0 = 0
+t <- t
+
+data_sir <- list(n_days = n_days, y0 = y0, t0 = t0, ts = t, N = N, cases = dths)
+```
+
+
+```{r}
+model_pr <- stan_model("sir_prior.stan")
+```
+
+```{r}
+# why does changing to a weak gamma prior take longer?
+fit_sir_prior <- sampling(model_pr,
+                          data = data_sir, 
+                          chains = 1,
+                          seed = 0)
+```
+
+```{r}
+s_prior <- rstan::extract(fit_sir_prior)
+prior_recovery <- ggplot(tibble(r = s_prior$recovery_time)) + 
+  geom_density(aes(x = r),fill="green", alpha = 0.6) + 
+  geom_vline(xintercept = c(3.4,9.4), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="Recovery time (days)",y="Probability density", title="Prior Predictive Check on Recovery Time ") +
+  theme_bw()
+
+prior_r0 <- ggplot(tibble(r = s_prior$R0)) + 
+  geom_density(aes(x = r),fill="green", alpha = 0.6) + 
+  geom_vline(xintercept = c(1,6), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="Basic reproduction number",y="Probability density", title = "Prior Predictive Check on R0") +
+  theme_bw()
+
+(prior_recovery / prior_r0)
+```
+
+
+
+We thus see that these distributions are coherent with domain knowledge.
+
+## Covid-19 Model: https://github.com/charlesm93/disease_transmission_workflow/tree/main/data
+
+```{r}
+library(tidybayes)
+library(gridExtra)
+df_swiss <- read_csv("swiss.csv")
+```
+
+The simple model is no longer sufficient for capturing certain properties of COVID-19 dynamics, and the predictions it gives are far enough from the data that we can be quite confident that the model is misspecified.
+
+The figure below displays the number of cases (positive PCR tests) reported each day over the considered period of time.
+
+```{r compare incidence and death_dt}
+df_swiss %>% 
+  ggplot() + 
+  geom_bar(mapping = aes(x = date, y = report_dt), fill = "green", color = "black", stat = "identity") +
+  labs(y="Number of reported cases") +
+  theme_bw()
+
+df_swiss %>% 
+  ggplot() + 
+  geom_bar(mapping = aes(x = date, y = death_dt), fill = "green", color = "black", stat = "identity") +
+  labs(y="Number of reported cases") +
+  theme_bw()
+```
+
+```{r}
+df_swiss %>% 
+  ggplot() + 
+  geom_bar(mapping = aes(x = date, y = total_tested), fill = "green", color = "black", stat = "identity") +
+  labs(y="Number of reported cases") +
+  theme_bw()
+
+df_swiss %>% 
+  ggplot() + 
+  geom_bar(mapping = aes(x = date, y = death_dt), fill = "green", color = "black", stat = "identity") +
+  labs(y="Number of reported cases") +
+  theme_bw()
+```
+The number of positives could be misleading in the beginning because not enough
+tests were being conducted.
+
+# Prior information: Domain knowledge about covid-19
+- Based on the data available so far, the R0 of COVID-19 is 1.4-3.9. (beta/gamma)
+- The death rate for this data set is 
+- The number of days between infection and death is
+
+# Basing the model on death counts rather than new infections
+In order to fit such a model to death data, modifications to the standard approach must be made. The observed deaths need to be linked to the underlying state variables of the ODE model via a sensible likelihood. We do this by means of a distribution for the time from infection to death, and an assumption about the infection fatality rate (IFR) – the proportion of infected individuals who will eventually die of COVID-19. 
+https://arxiv.org/pdf/2006.02985.pdf
+
+
+In this new setting, we only have access to the number of new cases on each given day, which constitutes incidence data.
+
+```{r}
+sir_model <- stan_model("sir_incidence.stan")
+```
+
+```{r}
+# Swiss population
+N <- 8.57E6;
+
+#initial conditions
+i0 <- 1 # assume 1 infected at beginning of outbreak.
+s0 <- N - i0
+r0 <- 0
+y0 = c(S = s0, I = i0, R = r0)
+
+# Cases
+cases <- df_swiss$report_dt
+
+# times
+n_days <- length(cases)
+t <- seq(1, n_days, by = 1)
+t0 = 0
+t <- t
+
+data_sir <- list(n_days = n_days, y0 = y0, t0 = t0, ts = t, N = N, cases = cases)
+```
+
+```{r}
+fit_sir <- sampling(sir_model, 
+                    data_sir, 
+                    iter=1000, # why was it not chains=4 
+                    seed = 0)
+```
+
+
+The largest R-hat is 1.54, indicating chains have not mixed.
+http://mc-stan.org/misc/warnings.html#r-hatBulk Effective Samples Size (ESS) is too low, indicating posterior means and medians may be unreliable.
+
+```{r}
+traceplot(fit_sir, pars = c("beta", "gamma", "lp__"))
+```
+
+```{r}
+fit_sir %>% 
+  spread_draws(pred_cases[n_days]) %>% 
+  left_join(tibble(cases = cases, n_days = 1:length(cases))) %>% 
+  group_by(n_days, .chain) %>% 
+  summarise(cases = mean(cases), pred_median = median(pred_cases), pred_9 = quantile(pred_cases, 0.95), pred_1 = quantile(pred_cases, 0.05)) %>% 
+   ggplot(aes(x = n_days)) +
+   #geom_ribbon(aes(ymin = pred_1, ymax = pred_9), fill = c_mid, alpha=0.7)+
+   geom_line(mapping = aes(y=pred_median), color = "red")+
+   geom_point(mapping = aes(y=cases), size=0.1)+
+  facet_wrap(~.chain, scales = "free") +
+  theme_bw()
+```
+# Using an underreporting factor.
+
+
+```{r}
+model_sir_underreporting <- stan_model("sir_underreporting.stan")
+```
+
+```{r}
+fit_sir_underreporting <- sampling(model_sir_underreporting, 
+                                   data_sir, 
+                                   iter=1000,
+                                   seed = 0)
+```
+
+```{r}
+print(fit_sir_underreporting)
+```
+
+
+```{r}
+check_hmc_diagnostics(fit_sir_underreporting)
+```
+
+HMC diagnostics check out.
+
+
+But does the model capture the dynamics in the data well? We can do a posterior predictive check:
+
+```{r}
+smr_pred <- cbind(as.data.frame(summary(fit_sir_underreporting, pars = "pred_cases", probs = c(0.025, 0.05, 0.1, 0.5, 0.9, 0.95, 0.975))$summary), t=1:(n_days-1), cases = cases[1:length(cases)-1])
+colnames(smr_pred) <- make.names(colnames(smr_pred)) # to remove % in the col names
+
+ggplot(smr_pred, mapping = aes(x = t)) +
+  #geom_ribbon(aes(ymin = X2.5., ymax = X97.5.), fill = c_dark, ) +
+  geom_ribbon(aes(ymin = X5., ymax = X95.), fill = 'green', alpha=0.35) +
+  #geom_ribbon(aes(ymin = X10., ymax = X90.), fill = c_light) +
+  geom_line(mapping = aes(x = t, y = X50.), color = 'green') +
+  geom_point(mapping = aes(y = cases)) +
+  labs(x = "Day", y = "Incidence")
+```
+
+# proxies for incidence on infections:
+
+
+# ASK WHETHER IT IS OK TO HAVE CHAINS THAT DONT CONVERGE. (in the mean time, write the intro, data, model, priors)
+# P_reported is tiny because infections are decreasing, so the model assumes that a whole bunch of people must be getting infected and immune (maybe ask how to account for this? Try fitting this on new data that does not have infections going down?)
+
+
+
+
+
+# Using death as a proxy for incidence (do not fit to serological data)
+However, for the reasons outlined above, case counts are
+wildly unreliable and mostly reflect the availability of testing and proportion of individuals who are asymptomatic rather than the actual size of the infected population.
+A better data source would be hospitalizations. Differences in testing policies for
+hospitalized patients across states make these data unreliable. Thus, here we build a
+model of the spread of COVID-19 fit only on data that has reasonable chance of being
+accurate: data on deaths attributable to COVID-19. Even these data are imperfect. (p. 6)
+```{r}
+# Cases
+inv_drate <- 10 # 0.1
+cases <- df_swiss$report_dt
+deaths <- df_swiss$death_dt*inv_drate
+t <- seq(1, n_days, by = 1)
+plot(x=t, y=cases)
+plot(x=t, y=deaths) # make 38 into 24
+
+shifted_de <- deaths[14:132] # shift deaths to cut out first 14 days
+n_days <- length(shifted_de)
+t <- seq(1, n_days, by = 1)
+plot(x=t, y=shifted_de)
+```
+
+```{r}
+# Swiss population
+N <- 8.57E6;
+
+#initial conditions
+i0 <- 1 # assume 1 infected at beginning of outbreak.
+s0 <- N - i0
+r0 <- 0
+y0 = c(S = s0, I = i0, R = r0)
+
+# Cases
+# Cases
+inv_drate <- 10 # 0.1
+cases <- df_swiss$report_dt
+deaths <- df_swiss$death_dt*inv_drate
+shifted_de <- deaths[14:132] # shift deaths to cut out first 14 days
+# times
+n_days <- length(shifted_de)
+t <- seq(1, n_days, by = 1)
+t0 = 0
+t <- t
+
+data_sir <- list(n_days = n_days, y0 = y0, t0 = t0, ts = t, N = N, cases = shifted_de)
+```
+
+
+```{r}
+fit_sir_dcounts <- sampling(model_sir_underreporting, 
+                                   data_sir, 
+                                   iter=1000,
+                                   seed = 0)
+```
+
+Why would chain 1 diverge so much from the others? Why do we use 4 chains instead of 1 or 10? What is the purpose between each chain?
+```{r}
+traceplot(fit_sir_dcounts, pars = c("gamma", "beta"))
+```
+
+```{r}
+fit_sir_dcounts %>% 
+  spread_draws(pred_cases[n_days]) %>% 
+  left_join(tibble(cases = cases, n_days = 1:length(cases))) %>% 
+  group_by(n_days, .chain) %>% 
+  summarise(cases = mean(cases), pred_median = median(pred_cases), pred_9 = quantile(pred_cases, 0.95), pred_1 = quantile(pred_cases, 0.05)) %>% 
+   ggplot(aes(x = n_days)) +
+   #geom_ribbon(aes(ymin = pred_1, ymax = pred_9), fill = c_mid, alpha=0.7)+
+   geom_line(mapping = aes(y=pred_median), color = "green")+
+   geom_point(mapping = aes(y=cases), size=0.1)+
+  facet_wrap(~.chain, scales = "free")
+```
+
+
+
+
+# Incorporating incubation time (E): 
+We add a parameter a, where 1/a corresponds to the average time between being infected and becoming infectious.
+
+As the data show a decrease in contaminations, the model is tempted to infer a high number of immune people, and thus a low proportion of case report. However, serological studies have shown that the total number of cases in Switzerland is not far from 10% of the population by May 2020. The decrease in transmission must be due to something else than immunity, and indeed control measures have been taken
+
+# Modeling control measures:
+We model decreasing transmission due to governmental control measure by a logistic function: beta(t)=f(t)∗beta
+f(t) is the decrease in transmission.
+
+We know that p_reported can’t be so low: this is an information we want to add to the model. This information can take the form of a prior: we could try to refine the prior on p_reported to incorporate more precise domain knowledge. This information can also take the form of additional data: here we can directly fit the data from serological tests into the model!
+
+# Fitting data from a serological survey:
+Found 83 people with Covid-19 antibody on 775 people tested in Geneva. It seems that covid data is very difficult to fit due to governmental control measures, asymptomatic transmission etc. Even though it is not performing as well, should I keep my model simple for interpretation?
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+New York
+```{r}
+NY <- us_states %>% 
+  filter(state == "New York") %>% 
+  filter(date > "2020-11-11")
+```
+
+
+```{r}
+cses_NY <- NY %>% 
+  ggplot() +
+  geom_bar(mapping = aes(x = date, y = cases), fill = "blue", color = "black", stat = "identity") + 
+  labs(y="cases", title = "Number of Cases in NY") +
+  theme_bw()
+
+dth_NY <- NY %>% 
+  ggplot() +
+  geom_bar(mapping = aes(x = date, y = deaths), fill = "blue", color = "black", stat = "identity") + 
+  labs(y="deaths", title = "Number of Deaths in NY") +
+  theme_bw()
+cses_NY |  dth_NY
+```
+
+# NY parameter estimates are same: 
+```{r}
+model_sir_undercounts <- stan_model("sir_underreporting.stan")
+```
+
+```{r}
+# NY population
+N <- 20.00E6;
+
+#initial conditions
+i0 <- 5200 # assume 5200 infected at beginning of outbreak.
+s0 <- N - i0
+r0 <- 0
+y0 = c(S = s0, I = i0, R = r0)
+
+# Cases
+# Cases
+# inv_drate <- 100 # 0.01
+cses <- NY$cases
+# times
+n_days <- length(cses)
+t <- seq(1, n_days, by = 1)
+t0 = 0
+t <- t
+
+data_sir <- list(n_days = n_days, y0 = y0, t0 = t0, ts = t, N = N, cases = cses)
+```
+
+```{r}
+NY_cases_fit <- sampling(model_sir_undercounts, 
+                                   data_sir, 
+                                   iter=1000,
+                                   seed = 0)
+```
+
+```{r}
+print(NY_cases_fit)
+```
+
+```{r}
+ccountnytrace <- traceplot(NY_cases_fit, pars = c("gamma", "beta", "recovery_time", "R0"))
+```
+
+
+North Carolina
+```{r}
+NC_first <- us_states %>% 
+  filter(state == "North Carolina") %>% 
+  filter(date < "2020-05-01")
+```
+
+```{r}
+NC_first_dths <- us_states %>% 
+  filter(state == "North Carolina") %>% 
+  filter(date < "2020-05-25")
+```
+
+
+```{r}
+cses_first <- NC_first %>% 
+  ggplot() +
+  geom_bar(mapping = aes(x = date, y = cases), fill = "brown", color = "black", stat = "identity") + 
+  labs(y="cases", title = "Number of Cases in NC") +
+  theme_bw()
+
+dth_first <- NC_first %>% 
+  ggplot() +
+  geom_bar(mapping = aes(x = date, y = deaths), fill = "brown", color = "black", stat = "identity") + 
+  labs(y="deaths", title = "Number of Deaths in NC") +
+  theme_bw()
+
+cses_first / dth_first
+```
+
+# Run on plain cases with underreporting: 
+```{r}
+model_sir_undercounts <- stan_model("sir_underreporting.stan")
+```
+
+```{r}
+# NC population
+N <- 10.00E6;
+
+#initial conditions
+i0 <- 100 # assume 2636 infected at beginning of outbreak.
+s0 <- N - i0
+r0 <- 0
+y0 = c(S = s0, I = i0, R = r0)
+
+# Cases
+# Cases
+# inv_drate <- 100 # 0.01
+cses <- NC_first$cases
+# times
+n_days <- length(cses)
+t <- seq(1, n_days, by = 1)
+t0 = 0
+t <- t
+
+data_sir <- list(n_days = n_days, y0 = y0, t0 = t0, ts = t, N = N, cases = cses)
+```
+
+```{r}
+early_cases_fit <- sampling(model_sir_undercounts, 
+                                   data_sir, 
+                                   iter=1000,
+                                   seed = 0)
+```
+POSTERIORS
+```{r}
+erlycases_sim <- extract(early_cases_fit)
+
+R0cases_erly <- ggplot(tibble(r = erlycases_sim$R0)) + 
+  geom_density(aes(x = r),fill="green", alpha = 0.6) + 
+  # geom_vline(xintercept = c(1,6), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="Basic reproduction number",y="Probability density", title = "Posterior Density of R0", subtitle = "using underreporting") +
+  theme_bw()
+
+recoverycases_erly <- ggplot(tibble(r = erlycases_sim$recovery_time)) + 
+  geom_density(aes(x = r),fill="green", alpha = 0.6) + 
+  # geom_vline(xintercept = c(1,6), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="Recovery Time (days)",y="Probability density", title = "Posterior Density of Recovery Time", subtitle="using underreporting") +
+  theme_bw()
+
+underreporting_erly <- ggplot(tibble(r = erlycases_sim$p_reported)) + 
+  geom_density(aes(x = r),fill="green", alpha = 0.6) + 
+  # geom_vline(xintercept = c(1,6), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="Proportion of Cases Reported",y="Probability density", title = "Posterior Density of Proportion of Cases Reported", subtitle = "using underreporting") +
+  theme_bw()
+```
+
+```{r}
+beta2 <- ggplot(tibble(r = erlycases_sim$beta)) + 
+  geom_density(aes(x = r),fill="green", alpha = 0.6) + 
+  # geom_vline(xintercept = c(1,6), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="value",y="Probability density", title = "Posterior Beta", subtitle = "using underreporting") +
+  theme_bw()
+
+gamma2 <- ggplot(tibble(r = erlycases_sim$gamma)) + 
+  geom_density(aes(x = r),fill="green", alpha = 0.6) + 
+  # geom_vline(xintercept = c(1,6), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="value",y="Probability density", title = "Posterior Gamma", subtitle = "using underreporting") +
+  theme_bw()
+
+phi2 <- ggplot(tibble(r = erlycases_sim$phi)) + 
+  geom_density(aes(x = r),fill="green", alpha = 0.6) + 
+  # geom_vline(xintercept = c(1,6), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="value",y="Probability density", title = "Posterior Phi", subtitle = "using underreporting") +
+  theme_bw()
+```
+
+```{r}
+beta2 | gamma2 | phi2
+```
+
+
+```{r}
+nc_early_cases_trace <- traceplot(early_cases_fit, pars = c("gamma", "beta", "recovery_time", "R0"))
+```
+
+```{r}
+print(early_cases_fit)
+```
+<3
+Cases Early
+                     mean se_mean       sd       2.5%        25%        50%        75%      97.5%
+gamma_inv            6.00    0.08     1.58       3.10       4.87       5.96       7.07       9.23
+beta                 0.28    0.00     0.06       0.20       0.24       0.27       0.31       0.43
+phi_inv              0.89    0.01     0.18       0.60       0.76       0.87       0.99       1.28
+p_reported           0.20    0.00     0.09       0.07       0.13       0.18       0.25       0.43
+
+
+```{r}
+smr_pred <- cbind(as.data.frame(summary(early_cases_fit, pars = "pred_cases", probs = c(0.025, 0.05, 0.1, 0.5, 0.9, 0.95, 0.975))$summary), t=1:(n_days-1), cases = cses[1:length(cses)-1])
+colnames(smr_pred) <- make.names(colnames(smr_pred)) # to remove % in the col names
+
+pred_early_cases <- ggplot(smr_pred, mapping = aes(x = t)) +
+  #geom_ribbon(aes(ymin = X2.5., ymax = X97.5.), fill = c_dark, ) +
+  geom_ribbon(aes(ymin = X5., ymax = X95.), fill = "green", alpha=0.35) +
+  #geom_ribbon(aes(ymin = X10., ymax = X90.), fill = c_light) +
+  geom_line(mapping = aes(x = t, y = X50.), color = "green") +
+  geom_point(mapping = aes(y = cases)) +
+  labs(x = "Day", y = "Incidence (Reported)", title = "Posterior Predictive Check NC Cases", subtitle = "Early Pandemic (March 2020 - May 2020)") +
+  theme_bw()
+```
+
+```{r}
+NC_first$deaths
+mean(NC_first$cases*5)
+mean(NC_first$deaths*100)
+```
+
+
+# Dths Early
+
+```{r}
+model_sir_dc <- stan_model("sir_dcount.stan")
+```
+
+
+```{r}
+# NC population
+N <- 10.00E6;
+
+#initial conditions
+i0 <- 100 # assume 2636 infected at beginning of outbreak.
+s0 <- N - i0
+r0 <- 0
+y0 = c(S = s0, I = i0, R = r0)
+
+# Cases
+# Cases
+# inv_drate <- 100 # 0.01
+cses <- NC_first$cases
+# times
+n_days <- length(cses)
+t <- seq(1, n_days, by = 1)
+t0 = 0
+t <- t
+
+data_sir <- list(n_days = n_days, y0 = y0, t0 = t0, ts = t, N = N, cases = cses)
+```
+
+```{r}
+# NC population
+N <- 10.00E6;
+
+#initial conditions
+i0 <- 100 # assume 10 infected at beginning of outbreak.
+s0 <- N - i0
+r0 <- 0
+y0 = c(S = s0, I = i0, R = r0)
+
+# Cases
+# Cases
+inv_drate <- 100 # 0.01
+dths <- NC_first_dths$deaths*inv_drate
+dths <- dths[!dths==0]
+
+dths_short <- dths[1:40]
+dths_short <- dths_short[!is.na(dths_short)]
+
+# times
+n_days <- length(dths_short)
+t <- seq(1, n_days, by = 1)
+t0 = 0
+t <- t
+
+data_sir <- list(n_days = n_days, y0 = y0, t0 = t0, ts = t, N = N, cases = dths_short)
+
+#plot(x = t, y = cses)
+plot(x = t, y = dths_short)
+```
+
+
+```{r}
+fit_erly_sir_dcounts <- sampling(model_sir_dc, 
+                                   data_sir, 
+                                   iter=1000,
+                                   seed = 0)
+```
+
+Deaths Early
+                      mean se_mean       sd       2.5%        25%        50%        75%      97.5% n_eff
+gamma_inv             1.31    0.00     0.05       1.22       1.28       1.31       1.34       1.41   479
+beta                  0.79    0.00     0.03       0.74       0.78       0.80       0.82       0.85   481
+phi_inv               0.59    0.00     0.06       0.48       0.55       0.59       0.63       0.73   835
+
+```{r}
+print(fit_sir_dcounts)
+```
+
+POSTERIORS
+```{r}
+fit_erly_sir_dcounts_sim <- extract(fit_erly_sir_dcounts)
+
+R0dths_erly <- ggplot(tibble(r = fit_erly_sir_dcounts_sim$R0)) + 
+  geom_density(aes(x = r),fill="green", alpha = 0.6) + 
+  # geom_vline(xintercept = c(1,6), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="Basic reproduction number",y="Probability density", title = "Posterior Density of R0", subtitle = "using death count") +
+  theme_bw()
+
+recoverydths_erly <- ggplot(tibble(r = fit_erly_sir_dcounts_sim$recovery_time)) + 
+  geom_density(aes(x = r),fill="green", alpha = 0.6) + 
+  # geom_vline(xintercept = c(1,6), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="Recovery Time (days)",y="Probability density", title = "Posterior Density of Recovery Time", subtitle = "using death count") +
+  theme_bw()
+```
+
+```{r}
+beta1 <- ggplot(tibble(r = fit_erly_sir_dcounts_sim$beta)) + 
+  geom_density(aes(x = r),fill="green", alpha = 0.6) + 
+  # geom_vline(xintercept = c(1,6), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="value",y="Probability density", title = "Posterior Beta", subtitle = "using death count") +
+  theme_bw()
+
+gamma1 <- ggplot(tibble(r = fit_erly_sir_dcounts_sim$gamma)) + 
+  geom_density(aes(x = r),fill="green", alpha = 0.6) + 
+  # geom_vline(xintercept = c(1,6), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="value",y="Probability density", title = "Posterior Gamma", subtitle = "using death count") +
+  theme_bw()
+
+phi1 <- ggplot(tibble(r = fit_erly_sir_dcounts_sim$phi)) + 
+  geom_density(aes(x = r),fill="green", alpha = 0.6) + 
+  # geom_vline(xintercept = c(1,6), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="value",y="Probability density", title = "Posterior Phi", subtitle = "using death count") +
+  theme_bw()
+```
+
+```{r}
+(beta1 | gamma1 | phi1) / (beta2 | gamma2 | phi2)
+```
+
+```{r}
+smr_pred <- cbind(as.data.frame(summary(fit_erly_sir_dcounts, pars = "pred_cases", probs = c(0.025, 0.05, 0.1, 0.5, 0.9, 0.95, 0.975))$summary), t=1:(n_days-1), cases = dths_short[1:length(dths_short)-1])
+colnames(smr_pred) <- make.names(colnames(smr_pred)) # to remove % in the col names
+
+pred_early_cases <- ggplot(smr_pred, mapping = aes(x = t)) +
+  #geom_ribbon(aes(ymin = X2.5., ymax = X97.5.), fill = c_dark, ) +
+  geom_ribbon(aes(ymin = X5., ymax = X95.), fill = "green", alpha=0.35) +
+  #geom_ribbon(aes(ymin = X10., ymax = X90.), fill = c_light) +
+  geom_line(mapping = aes(x = t, y = X50.), color = "green") +
+  geom_point(mapping = aes(y = cases)) +
+  labs(x = "Day", y = "Incidence (Death Counts)", title = "Posterior Predictive Check NC Cases", subtitle = "Early Pandemic (March 2020 - May 2020)") +
+  theme_bw()
+```
+
+
+
+```{r}
+early_dth_trace <- traceplot(fit_erly_sir_dcounts, pars = c("gamma", "beta", "recovery_time", "R0"))
+```
+POSTERIORS
+```{r}
+(R0dths_erly | recoverydths_erly) / ( R0cases_erly | recoverycases_erly )
+```
+
+```{r}
+smr_pred <- cbind(as.data.frame(summary(fit_erly_sir_dcounts, pars = "pred_cases", probs = c(0.025, 0.05, 0.1, 0.5, 0.9, 0.95, 0.975))$summary), t=1:(n_days-1), cases = dths_short[1:length(dths_short)-1])
+colnames(smr_pred) <- make.names(colnames(smr_pred)) # to remove % in the col names
+
+pred_early_dth_plot <- ggplot(smr_pred, mapping = aes(x = t)) +
+  #geom_ribbon(aes(ymin = X2.5., ymax = X97.5.), fill = c_dark, ) +
+  geom_ribbon(aes(ymin = X5., ymax = X95.), fill = "green", alpha=0.35) +
+  #geom_ribbon(aes(ymin = X10., ymax = X90.), fill = c_light) +
+  geom_line(mapping = aes(x = t, y = X50.), color = "green") +
+  geom_point(mapping = aes(y = cases)) +
+  scale_y_continuous(limits = c(0, 30000)) + 
+  labs(x = "Day", y = "Incidence (estimated using death counts) ", title = "Posterior Predictive Check NC Cases", subtitle = "Early Pandemic (March - May 2020)") +
+  theme_bw()
+```
+
+
+```{r}
+fit_sir_nccounts <- sampling(model_sir_undercounts, 
+                                   data_sir, 
+                                   iter=1000,
+                                   seed = 0)
+```
+
+
+```{r}
+d <- NC_first$deaths
+d <- tail(d,-20)
+mean(NC_first$cases*5)
+mean(d*100)
+```
+
+The posterior for the p-reported is 0.20. This matches with the number of cases predicted by deaths (which was 100*observed-deaths). The means of the former across the entire time period was 890.4237 cases, while the mean of the latter is 987.1795 cases. 
+
+
+```{r}
+print(fit_sir_nccounts)
+```
+
+```{r}
+traceplot(fit_sir_nccounts, pars = c("gamma", "beta", "recovery_time", "R0"))
+```
+
+
+```{r}
+NC <- us_states %>% 
+  filter(state == "North Carolina") %>% 
+  filter(date > "2020-11-11")
+```
+
+```{r}
+# library(patchwork)
+csesPlot <- NC %>% 
+  ggplot() +
+  geom_bar(mapping = aes(x = date, y = cases), fill = "brown", color = "brown", stat = "identity") + 
+  labs(y="cases", title = "Number of Cases in NC") +
+  theme_bw()
+
+dthPlot <- NC %>% 
+  ggplot() +
+  geom_bar(mapping = aes(x = date, y = deaths), fill = "brown", color = "brown", stat = "identity") + 
+  labs(y="deaths", title = "Number of Deaths in NC") +
+  theme_bw()
+
+csesPlot / dthPlot
+```
+# d counts 2
+```{r}
+# NC population
+N <- 10.00E6;
+
+#initial conditions
+i0 <- 2636 # assume 2636 infected at beginning of outbreak.
+s0 <- N - i0
+r0 <- 0
+y0 = c(S = s0, I = i0, R = r0)
+
+# Cases
+# Cases
+inv_drate <- 100 # 0.01
+dths <- NC$deaths*inv_drate
+dths <- dths[!dths==0]
+# times
+n_days <- length(dths)
+t <- seq(1, n_days, by = 1)
+t0 = 0
+t <- t
+
+data_sir <- list(n_days = n_days, y0 = y0, t0 = t0, ts = t, N = N, cases = dths)
+```
+
+
+```{r}
+fit_sir_dcounts <- sampling(model_sir_dc, 
+                                   data_sir, 
+                                   iter=1000,
+                                   seed = 0)
+```
+
+<3
+
+Death Counts 2
+                      mean se_mean       sd       2.5%        25%        50%        75%
+gamma_inv             1.31    0.00     0.05       1.22       1.28       1.31       1.34
+beta                  0.79    0.00     0.03       0.74       0.78       0.80       0.82
+phi_inv               0.59    0.00     0.06       0.48       0.55       0.59       0.63
+
+Chain converges with sir_dcounts but unsure why the gamma and beta values look so similar, making R0 really small. This is the same for the casecounts 2.
+```{r}
+print(fit_sir_dcounts)
+```
+
+POSTERIORS
+```{r}
+latedt_sim <- extract(fit_sir_dcounts)
+
+R0dt_late <- ggplot(tibble(r = latedt_sim$R0)) + 
+  geom_density(aes(x = r),fill="green", alpha = 0.6) + 
+  # geom_vline(xintercept = c(1,6), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="Basic reproduction number",y="Probability density", title = "Posterior Density of R0", subtitle = "using death counts") +
+  theme_bw()
+
+recoverydt_late <- ggplot(tibble(r = latedt_sim$recovery_time)) + 
+  geom_density(aes(x = r),fill="green", alpha = 0.6) + 
+  # geom_vline(xintercept = c(1,6), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="Recovery Time (days)",y="Probability density", title = "Posterior Density of Recovery Time", subtitle = "using death counts") +
+  theme_bw()
+```
+
+```{r}
+beta3 <- ggplot(tibble(r = latedt_sim $beta)) + 
+  geom_density(aes(x = r),fill="green", alpha = 0.6) + 
+  # geom_vline(xintercept = c(1,6), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="value",y="Probability density", title = "Posterior Beta", subtitle = "using death count") +
+  theme_bw()
+
+gamma3 <- ggplot(tibble(r = latedt_sim $gamma)) + 
+  geom_density(aes(x = r),fill="green", alpha = 0.6) + 
+  # geom_vline(xintercept = c(1,6), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="value",y="Probability density", title = "Posterior Gamma", subtitle = "using death count") +
+  theme_bw()
+
+phi3 <- ggplot(tibble(r = latedt_sim $phi)) + 
+  geom_density(aes(x = r),fill="green", alpha = 0.6) + 
+  # geom_vline(xintercept = c(1,6), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="value",y="Probability density", title = "Posterior Phi", subtitle = "using death count") +
+  theme_bw()
+```
+
+```{r}
+beta3 | gamma3 | phi3
+```
+
+
+```{r}
+dcount2trace <- traceplot(fit_sir_dcounts, pars = c("gamma", "beta", "recovery_time", "R0"))
+```
+
+<3
+
+```{r}
+smr_pred <- cbind(as.data.frame(summary(fit_sir_dcounts, pars = "pred_cases", probs = c(0.025, 0.05, 0.1, 0.5, 0.9, 0.95, 0.975))$summary), t=1:(n_days-1), cases = dths[1:length(dths)-1])
+colnames(smr_pred) <- make.names(colnames(smr_pred)) # to remove % in the col names
+
+pred_dths_nc <- ggplot(smr_pred, mapping = aes(x = t)) +
+  #geom_ribbon(aes(ymin = X2.5., ymax = X97.5.), fill = c_dark, ) +
+  geom_ribbon(aes(ymin = X5., ymax = X95.), fill = "green", alpha=0.35) +
+  #geom_ribbon(aes(ymin = X10., ymax = X90.), fill = c_light) +
+  geom_line(mapping = aes(x = t, y = X50.), color = "green") +
+  geom_point(mapping = aes(y = cases)) +
+  labs(x = "Day", y = "Incidence (estimated using death counts)", title = "Posterior Predictive Check NC Cases") +
+  theme_bw()
+```
+
+Note: the reported cases here are death counts multiplied by the 1/IFR.
+
+
+<3
+the seir model results in the same gamma and beta parameters.
+```{r}
+seir_model <- stan_model("seir_incidence.stan")
+```
+
+
+```{r}
+# NC population
+N <- 10.00E6;
+
+#initial conditions
+e0 <- 2636
+i0 <- 2636 # assume 2636 infected at beginning of outbreak.
+s0 <- N - i0
+r0 <- 0
+y0 = c(S = s0, E = e0, I = i0, R = r0)
+
+# Cases
+cses <- NC$cases
+cses[!cses==0]
+# times
+n_days <- length(cses)
+t <- seq(1, n_days, by = 1)
+t0 = 0
+t <- t
+
+data_sir <- list(n_days = n_days, y0 = y0, t0 = t0, ts = t, N = N, cases = cses)
+```
+
+```{r}
+fit_seir <- sampling(seir_model, 
+                              data_sir, 
+                              iter=1000,
+                              seed = 0)
+```
+
+```{r}
+seirtrace1 <- traceplot(fit_seir, pars = c("gamma", "beta", "recovery_time", "R0"))
+```
+
+```{r}
+smr_pred <- cbind(as.data.frame(summary(fit_seir, pars = "pred_cases", probs = c(0.025, 0.05, 0.1, 0.5, 0.9, 0.95, 0.975))$summary), t=1:(n_days-1), cases = cses[1:length(cses)-1])
+colnames(smr_pred) <- make.names(colnames(smr_pred)) # to remove % in the col names
+
+ggplot(smr_pred, mapping = aes(x = t)) +
+  #geom_ribbon(aes(ymin = X2.5., ymax = X97.5.), fill = c_dark, ) +
+  geom_ribbon(aes(ymin = X5., ymax = X95.), fill = 'green', alpha=0.35) +
+  #geom_ribbon(aes(ymin = X10., ymax = X90.), fill = c_light) +
+  geom_line(mapping = aes(x = t, y = X50.), color = 'green') +
+  geom_point(mapping = aes(y = cases)) +
+  labs(x = "Day", y = "Reported Cases", title = "Posterior Predictive Check NC Deaths (Nov - April)") +
+  theme_bw()
+```
+
+
+```{r}
+fit_sir_nccounts <- sampling(model_sir_undercounts, 
+                                   data_sir, 
+                                   iter=1000,
+                                   seed = 0)
+```
+
+
+```{r}
+print(fit_sir_nccounts)
+```
+
+
+```{r}
+traceplot(fit_sir_nccounts, pars = c("gamma", "beta", "recovery_time", "R0"))
+```
+
+
+case count 2
+
+```{r}
+# NC population
+N <- 10.00E6;
+
+#initial conditions
+e0 <- 2636
+i0 <- 2636 # assume 2636 infected at beginning of outbreak.
+s0 <- N - i0
+r0 <- 0
+y0 = c(S = s0, E = e0, I = i0, R = r0)
+
+# Cases
+cses <- NC$cases
+cses[!cses==0]
+# times
+n_days <- length(cses)
+t <- seq(1, n_days, by = 1)
+t0 = 0
+t <- t
+
+data_sir <- list(n_days = n_days, y0 = y0, t0 = t0, ts = t, N = N, cases = cses)
+```
+
+
+```{r}
+csesPlot <- NC %>% 
+  ggplot() +
+  geom_bar(mapping = aes(x = date, y = cases), fill = "brown", color = "black", stat = "identity") + 
+  labs(y="cases", title = "Number of Cases in NC") +
+  theme_bw()
+csesPlot
+```
+
+```{r}
+second_cases_fit <- sampling(model_sir_undercounts, 
+                                   data_sir, 
+                                   iter=1000,
+                                   seed = 0)
+```
+
+POSTERIORS
+```{r}
+caseslate_sim <- extract(second_cases_fit)
+
+R0cases_late <- ggplot(tibble(r = caseslate_sim$R0)) + 
+  geom_density(aes(x = r),fill="green", alpha = 0.6) + 
+  # geom_vline(xintercept = c(1,6), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="Basic reproduction number",y="Probability density", title = "Posterior Density of R0", subtitle = "using underreporting parameter") +
+  theme_bw()
+
+recoverycases_late <- ggplot(tibble(r = caseslate_sim$recovery_time)) + 
+  geom_density(aes(x = r),fill="green", alpha = 0.6) + 
+  # geom_vline(xintercept = c(1,6), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="Recovery Time (days)",y="Probability density", title = "Posterior Density of Recovery Time", subtitle = "using underreporting parameter") +
+  theme_bw()
+
+underreporting_2 <- ggplot(tibble(r = caseslate_sim$p_reported)) + 
+  geom_density(aes(x = r),fill="green", alpha = 0.6) + 
+  # geom_vline(xintercept = c(1,6), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="Proportion of Cases Reported",y="Probability density", title = "Posterior Density of Proportion of Cases Reported", subtitle = "winter wave") +
+  theme_bw()
+```
+
+```{r}
+beta4 <- ggplot(tibble(r = caseslate_sim$beta)) + 
+  geom_density(aes(x = r),fill="green", alpha = 0.6) + 
+  # geom_vline(xintercept = c(1,6), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="value",y="Probability density", title = "Posterior Beta", subtitle = "using death count") +
+  theme_bw()
+
+gamma4 <- ggplot(tibble(r = caseslate_sim$gamma)) + 
+  geom_density(aes(x = r),fill="green", alpha = 0.6) + 
+  # geom_vline(xintercept = c(1,6), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="value",y="Probability density", title = "Posterior Gamma", subtitle = "using death count") +
+  theme_bw()
+
+phi4 <- ggplot(tibble(r = caseslate_sim$phi)) + 
+  geom_density(aes(x = r),fill="green", alpha = 0.6) + 
+  # geom_vline(xintercept = c(1,6), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="value",y="Probability density", title = "Posterior Phi", subtitle = "using death count") +
+  theme_bw()
+```
+
+```{r}
+(beta3 | gamma3 | phi3) / (beta4 | gamma4 | phi4)
+```
+
+
+```{r}
+underreporting_erly / underreporting_2
+
+x <- data.frame(late_stage=caseslate_sim$p_reported,early_stage=erlycases_sim$p_reported)
+library(ggplot2);library(reshape2)
+data<- melt(x)
+data <- data %>% 
+  rename(stage = variable)
+prop_posterior <- ggplot(data,aes(x=value, fill=stage)) + 
+  geom_density(alpha=0.25) +
+  labs(title = "Posterior Density of Proportion of Cases Reported", subtitle = "by stage of pandemic", x="Proportion of Cases Reported") + 
+  theme_bw()
+```
+
+```{r}
+(R0dt_late / R0cases_late ) | (recoverydt_late / recoverycases_late)
+```
+
+<3
+```{r}
+casecount2trace <- traceplot(second_cases_fit, pars = c("gamma", "beta", "recovery_time", "R0"))
+```
+second cases fit:
+
+                      mean se_mean       sd       2.5%        25%        50%        75%      97.5% n_eff Rhat
+gamma_inv             1.27    0.00     0.07       1.15       1.22       1.27       1.32       1.42   442 1.01
+beta                  0.82    0.00     0.04       0.74       0.79       0.82       0.85       0.89   460 1.01
+phi_inv               1.32    0.00     0.14       1.07       1.22       1.31       1.41       1.60  1046 1.00
+p_reported            0.88    0.00     0.07       0.73       0.84       0.89       0.93       0.98   530 1.00
+
+
+```{r}
+print(second_cases_fit)
+```
+
+
+
+```{r}
+print(fit_sir_nccases)
+```
+
+```{r}
+traceplot(fit_sir_nccases, pars = c("gamma", "beta", "recovery_time", "R0"))
+```
+
+
+
+```{r}
+smr_pred <- cbind(as.data.frame(summary(second_cases_fit, pars = "pred_cases", probs = c(0.025, 0.05, 0.1, 0.5, 0.9, 0.95, 0.975))$summary), t=1:(n_days-1), cases = cses[1:length(cses)-1])
+colnames(smr_pred) <- make.names(colnames(smr_pred)) # to remove % in the col names
+
+post_pred_cases_nc <- ggplot(smr_pred, mapping = aes(x = t)) +
+  #geom_ribbon(aes(ymin = X2.5., ymax = X97.5.), fill = c_dark, ) +
+  geom_ribbon(aes(ymin = X5., ymax = X95.), fill = 'green', alpha=0.35) +
+  #geom_ribbon(aes(ymin = X10., ymax = X90.), fill = c_light) +
+  geom_line(mapping = aes(x = t, y = X50.), color = 'green') +
+  geom_point(mapping = aes(y = cases)) +
+  labs(x = "Day", y = "Incidence (Reported)", title = "Posterior Predictive Check NC Cases") +
+  theme_bw()
+```
+
+<3
+```{r}
+mean(NC$deaths*100)
+mean(NC$cases/0.88)
+```
+
+```{r}
+post_pred_cases_nc
+pred_dths_nc
+```
+
+
+
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
